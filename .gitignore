@@ -1,0 +1,6 @@
+.env
+*.db
+*.session
+__pycache__/
+links.txt
+avatars/
