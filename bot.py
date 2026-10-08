@@ -4,19 +4,20 @@
 """
 import asyncio
 import logging
+import time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (BotCommand, MenuButtonCommands, CallbackQuery, InlineQuery, InlineQueryResultArticle,
+from aiogram.types import (LabeledPrice, PreCheckoutQuery, BotCommand, MenuButtonCommands, CallbackQuery, InlineQuery, InlineQueryResultArticle,
                            InputTextMessageContent, KeyboardButton, KeyboardButtonRequestChat,
                            Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
 import db
 import views
-from config import ADMINS, ALLOW_CHANNELS, BOT_TOKEN, PAGE_SIZE, SOURCE_CHANNELS, is_admin
+from config import ADMINS, ALLOW_CHANNELS, BOT_TOKEN, PAGE_SIZE, PIN_PLANS, SOURCE_CHANNELS, is_admin
 from importer import post_fields, resolve, run_import
 from linkparser import Found, Post, extract, parse_post
 from tgrich import Rich, esc
@@ -29,6 +30,20 @@ dp = Dispatcher()
 r = Router()
 r.message.filter(F.chat.type == "private")
 ch_router = Router()  # посты каналов-источников
+pay = Router()  # оплаты — подключается первым, чтобы FSM-состояния не перехватили successful_payment
+
+
+@r.message.outer_middleware()
+@r.callback_query.outer_middleware()
+async def track_activity(handler, event, data):
+    u = event.from_user
+    chat = event.chat if isinstance(event, Message) else (event.message.chat if event.message else None)
+    if u and not u.is_bot and chat and chat.type == "private":
+        try:
+            await db.touch_user(u.id, u.full_name)
+        except Exception:
+            logging.exception("touch_user")
+    return await handler(event, data)
 
 
 class Add(StatesGroup):
@@ -524,8 +539,8 @@ async def cb_all(cq: CallbackQuery):
 @r.callback_query(F.data.startswith("top:"))
 async def cb_top(cq: CallbackQuery):
     page = int(cq.data.split(":")[1])
-    rows, total = await db.list_chats(offset=page * PAGE_SIZE, limit=PAGE_SIZE, order="members DESC, id DESC")
-    await show(cq, views.chat_table("🔥 Топ по участникам", rows, total, page, PAGE_SIZE, "top"))
+    rows, total = await db.list_chats(offset=page * PAGE_SIZE, limit=PAGE_SIZE, order=db.ORDER_TOP)
+    await show(cq, views.chat_table("🔥 Топ по рейтингу", rows, total, page, PAGE_SIZE, "top"))
     await cq.answer()
 
 
@@ -534,7 +549,9 @@ async def cb_random(cq: CallbackQuery):
     ch = await db.random_chat()
     if not ch:
         return await cq.answer("В каталоге пока нет чатов", show_alert=True)
-    await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id), random=True))
+    await db.log_view(ch["id"], cq.from_user.id)
+    await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id), random=True,
+                                                    my_vote=await db.my_vote(cq.from_user.id, ch["id"])))
     await cq.answer("🎲")
 
 
@@ -552,8 +569,116 @@ async def cb_card(cq: CallbackQuery):
     ch = await db.chat(int(cq.data.split(":")[1]))
     if not ch:
         return await cq.answer("Чат удалён", show_alert=True)
-    await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id)))
+    await db.log_view(ch["id"], cq.from_user.id)
+    await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id),
+                                                    my_vote=await db.my_vote(cq.from_user.id, ch["id"])))
     await cq.answer()
+
+
+# ---------- лайки ----------
+@r.callback_query(F.data.startswith("vote:"))
+async def cb_vote(cq: CallbackQuery):
+    _, v, cid = cq.data.split(":")
+    ch = await db.chat(int(cid))
+    if not ch or ch["status"] != "approved":
+        return await cq.answer("Чат удалён", show_alert=True)
+    new = await db.vote(cq.from_user.id, ch["id"], int(v))
+    ch = await db.chat(ch["id"])
+    mk = cq.message.reply_markup
+    rnd = bool(mk) and any(x.callback_data == "rnd" for row in mk.inline_keyboard for x in row)
+    _, kb = views.card(ch, admin=is_admin(cq.from_user.id), random=rnd, my_vote=new)
+    try:
+        await rich.call("editMessageReplyMarkup", chat_id=cq.message.chat.id,
+                        message_id=cq.message.message_id, reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logging.warning("vote edit: %s", e)
+    await cq.answer({1: "👍 Нравится", -1: "👎 Не нравится", 0: "Голос снят"}[new])
+
+
+# ---------- закрепление за звёзды ----------
+@r.callback_query(F.data.startswith("pinm:"))
+async def cb_pin_menu(cq: CallbackQuery):
+    ch = await db.chat(int(cq.data.split(":")[1]))
+    if not ch or ch["status"] != "approved":
+        return await cq.answer("Чат удалён", show_alert=True)
+    if not PIN_PLANS:
+        return await cq.answer("Закрепление сейчас недоступно", show_alert=True)
+    await rich.send(cq.message.chat.id, *views.pin_menu(ch, PIN_PLANS))
+    await cq.answer()
+
+
+@r.callback_query(F.data.startswith("pinb:"))
+async def cb_pin_buy(cq: CallbackQuery):
+    _, cid, days = cq.data.split(":")
+    plan = dict(PIN_PLANS).get(int(days))
+    ch = await db.chat(int(cid))
+    if not ch or plan is None:
+        return await cq.answer("Тариф недоступен", show_alert=True)
+    title = (ch["title"] or "чат")[:20]
+    await bot.send_invoice(
+        cq.message.chat.id,
+        title=f"Закрепление в топе: {views.days_word(days)}",
+        description=f"«{title}» будет первым в каталоге с отметкой 📌 на {views.days_word(days)}.",
+        payload=f"pin:{ch['id']}:{days}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"📌 {views.days_word(days)}", amount=plan)],
+    )
+    await cq.answer()
+
+
+@pay.pre_checkout_query()
+async def pre_checkout(pq: PreCheckoutQuery):
+    ok = False
+    try:
+        kind, cid, days = pq.invoice_payload.split(":")
+        ch = await db.chat(int(cid))
+        ok = kind == "pin" and ch and ch["status"] == "approved" and dict(PIN_PLANS).get(int(days)) == pq.total_amount
+    except Exception:
+        pass
+    await pq.answer(ok=bool(ok), error_message=None if ok else "Чат удалён или тариф изменился. Деньги не списаны.")
+
+
+@pay.message(F.successful_payment)
+async def paid(m: Message):
+    sp = m.successful_payment
+    _, cid, days = sp.invoice_payload.split(":")
+    until = await db.pin(int(cid), m.from_user.id, int(days), sp.total_amount, sp.telegram_payment_charge_id)
+    ch = await db.chat(int(cid))
+    date = time.strftime("%d.%m.%Y %H:%M", time.localtime(until))
+    await rich.send(m.chat.id, f"<h3>📌 Готово! «{esc(ch['title'])}» в топе до {date}</h3>"
+                               "<p>Спасибо за поддержку каталога ⭐</p>",
+                    views.kb([views.btn("🔥 Открыть топ", "top:0", style="primary")]))
+    for a in ADMINS:
+        try:
+            await rich.send(a, f"<p>⭐ Оплата {sp.total_amount} звёзд: закрепление «{esc(ch['title'])}» на "
+                               f"{views.days_word(days)} от <a href=\"tg://user?id={m.from_user.id}\">"
+                               f"{esc(m.from_user.full_name)}</a>.</p>")
+        except Exception:
+            pass
+
+
+@r.message(Command("paysupport"))
+async def cmd_paysupport(m: Message):
+    await m.answer("💬 Вопросы по оплате закрепления: напишите сюда, что случилось, и укажите название чата — "
+                   "администратор ответит и при необходимости вернёт звёзды.")
+
+
+@r.message(Command("refund"))
+async def cmd_refund(m: Message, command: CommandObject):
+    if not is_admin(m.from_user.id):
+        return
+    if not (command.args or "").strip().lstrip("#").isdigit():
+        return await m.answer("Использование: /refund номер_оплаты (номер есть в 📊 Статистике)")
+    p = await db.payment(int(command.args.strip().lstrip("#")))
+    if not p or p["refunded"]:
+        return await m.answer("Оплата не найдена или уже возвращена.")
+    try:
+        await bot.refund_star_payment(user_id=p["user_id"], telegram_payment_charge_id=p["charge_id"])
+    except Exception as e:
+        return await m.answer(f"Не получилось: {esc(str(e))}")
+    await db.mark_refunded(p["id"])
+    await m.answer(f"↩️ Возвращено {p['stars']} ⭐, закрепление снято на {views.days_word(p['days'])}.")
 
 
 @r.callback_query(F.data == "add")
@@ -579,13 +704,15 @@ async def next_pending(cq: CallbackQuery, prefix: str = ""):
     await show(cq, (prefix + f"<p>📝 В очереди: {total}</p>" + body, kb))
 
 
-@r.callback_query(F.data.in_({"adm", "pend", "imp"}) | F.data.regexp(r"^(mod|del|delok|ren|pic):"))
+@r.callback_query(F.data.in_({"adm", "pend", "imp", "stats"}) | F.data.regexp(r"^(mod|del|delok|ren|pic):"))
 async def cb_admin(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
         return await cq.answer("Только для админов", show_alert=True)
     d = cq.data
     if d == "adm":
         await show(cq, views.admin_panel(await db.stats()))
+    elif d == "stats":
+        await show(cq, views.stats_view(await db.full_stats()))
     elif d == "pend":
         await next_pending(cq)
     elif d == "imp":
@@ -651,12 +778,14 @@ async def inline(iq: InlineQuery):
 # ============================ run ============================
 async def main():
     await db.init()
+    dp.include_router(pay)
     dp.include_router(r)
     dp.include_router(ch_router)
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="help", description="Как пользоваться"),
         BotCommand(command="cancel", description="Отменить действие"),
+        BotCommand(command="paysupport", description="Помощь с оплатой"),
     ])
     # сброс того, что осталось от прежнего бота: кнопка меню Mini App, старые апдейты/вебхук
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
