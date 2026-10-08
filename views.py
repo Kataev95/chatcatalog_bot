@@ -1,7 +1,7 @@
 """Вёрстка: rich-HTML сообщения и инлайн-клавиатуры с цветными кнопками (style)."""
 from tgrich import esc
 
-KIND = {"group": "💬 Группа", "supergroup": "💬 Группа", "channel": "📢 Канал", "private_link": "🔒 Приватный"}
+KIND = {"group": "💬 Чат", "supergroup": "💬 Чат", "channel": "📢 Канал", "private_link": "💬 Чат"}
 
 
 def num(n) -> str:
@@ -51,7 +51,7 @@ def home(st, admin=False):
         "<footer>Ищи прямо отсюда: просто напиши слово, например «крипта».</footer>"
     )
     rows = [
-        [btn("📚 Каталог", "cats", style="primary"), btn("🔥 Топ", "top:0")],
+        [btn("💬 Все чаты", "all:0", style="primary"), btn("🔥 Топ", "top:0")],
         [btn("➕ Добавить свой чат", "add", style="success")],
         [btn("🔍 Поиск", "search")],
     ]
@@ -60,20 +60,7 @@ def home(st, admin=False):
     return body, kb(*rows)
 
 
-def categories(cats):
-    items = "".join(f"<li>{esc(c['emoji'])} <b>{esc(c['name'])}</b> — {c['n']}</li>" for c in cats)
-    body = f"<h2>📚 Категории</h2><ul>{items}</ul>"
-    rows, row = [], []
-    for c in cats:
-        row.append(btn(f"{c['emoji']} {c['name']} · {c['n']}", f"cat:{c['id']}:0"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    rows += [row, [btn("⬅️ Меню", "home")]]
-    return body, kb(*rows)
-
-
-def chat_table(title, rows, total, page, page_size, nav_prefix, back="cats"):
+def chat_table(title, rows, total, page, page_size, nav_prefix, back="home"):
     pages = max(1, (total + page_size - 1) // page_size)
     if not rows:
         body = f"<h2>{esc(title)}</h2><p>Пока пусто. Будь первым — добавь свой чат!</p>"
@@ -81,6 +68,7 @@ def chat_table(title, rows, total, page, page_size, nav_prefix, back="cats"):
     trs = "".join(
         f"<tr><td align=\"right\">{page * page_size + i + 1}</td>"
         f"<td><a href=\"{esc(link(r))}\">{esc(r['title'] or r['username'])}</a></td>"
+        f"<td align=\"center\">{esc(r.get('age') or '—')}</td>"
         f"<td align=\"right\">{num(r['members']) if r['members'] else '—'}</td></tr>"
         for i, r in enumerate(rows)
     )
@@ -88,7 +76,7 @@ def chat_table(title, rows, total, page, page_size, nav_prefix, back="cats"):
     collage = ("<tg-collage>" + "".join(f"<img src=\"{x}\"/>" for x in refs) + "</tg-collage>") if len(refs) >= 2 else ""
     body = (
         f"<h2>{esc(title)}</h2>{collage}"
-        f"<table striped compact><tr><th>#</th><th>Чат</th><th>👥</th></tr>{trs}</table>"
+        f"<table striped compact><tr><th>#</th><th>Чат</th><th>Возраст</th><th>👥</th></tr>{trs}</table>"
         f"<footer>Страница {page + 1} из {pages} · всего {total}. Нажми номер, чтобы открыть карточку.</footer>"
     )
     nums = [btn(str(page * page_size + i + 1), f"card:{r['id']}") for i, r in enumerate(rows)]
@@ -107,15 +95,16 @@ def card(ch, admin=False, moderation=False):
     meta = [KIND.get(ch.get("kind"), "💬 Чат")]
     if ch.get("members"):
         meta.append(f"👥 {num(ch['members'])}")
-    if ch.get("cat_name"):
-        meta.append(f"{esc(ch['cat_emoji'])} {esc(ch['cat_name'])}")
+    if ch.get("age"):
+        meta.append(f"🔞 {esc(ch['age'])}")
     about = f"<blockquote expandable>{esc(ch['about'])}</blockquote>" if ch.get("about") else ""
+    tags = f"<p>{esc(ch['tags'])}</p>" if ch.get("tags") else ""
     handle = f"<p><b>@{esc(ch['username'])}</b></p>" if ch.get("username") else ""
     ref = photo_ref(ch)
     pic = f"<figure><img src=\"{ref}\"/></figure>" if ref else ""
     body = (
         f"{pic}<h2>{esc(ch.get('title') or ch.get('username') or 'Чат')}</h2>"
-        f"{handle}<p>{' · '.join(meta)}</p>{about}"
+        f"{handle}<p>{' · '.join(meta)}</p>{about}{tags}"
         "<tg-button-row align=\"center\">"
         f"<tg-button type=\"url\" style=\"success\" url=\"{esc(url)}\">Вступить</tg-button>"
         f"<tg-button type=\"copy_text\" text=\"{esc(url)}\">Скопировать ссылку</tg-button>"
@@ -125,24 +114,13 @@ def card(ch, admin=False, moderation=False):
         body += f"<footer>Заявка #{ch['id']} · от <a href=\"tg://user?id={ch['added_by']}\">пользователя</a></footer>"
         return body, kb([btn("✅ Одобрить", f"mod:ok:{ch['id']}", style="success"),
                          btn("❌ Отклонить", f"mod:no:{ch['id']}", style="danger")],
-                        [btn("🏷 Категория", f"setcat:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}")])
+                        [btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}")])
     rows = [[btn("↗️ Поделиться", copy=url)]]
     if admin:
-        rows.append([btn("🏷 Категория", f"setcat:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}"),
+        rows.append([btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}"),
                      btn("🗑 Удалить", f"del:{ch['id']}", style="danger")])
-    rows.append([btn("⬅️ К каталогу", "cats")])
+    rows.append([btn("⬅️ Ко всем чатам", "all:0")])
     return body, kb(*rows)
-
-
-def pick_category(cats, prefix):
-    rows, row = [], []
-    for c in cats:
-        row.append(btn(f"{c['emoji']} {c['name']}", f"{prefix}:{c['id']}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    rows.append(row)
-    return kb(*rows)
 
 
 def admin_panel(st):
@@ -152,26 +130,25 @@ def admin_panel(st):
         f"<tr><td>На модерации</td><td align=\"right\">{st['pending']}</td></tr>"
         f"<tr><td>Пользователей</td><td align=\"right\">{st['users']}</td></tr></table>"
         "<details><summary>Как массово добавить чаты</summary>"
-        "<ol><li>Просто перешли мне посты из канала-подборки — я вытащу все ссылки, даже скрытые под текстом.</li>"
+        "<ol><li>Просто перешли мне посты из канала-подборки. Пост про один чат (картинка, название, ссылка, "
+        "описание, возраст) добавится карточкой целиком, с картинкой. Из поста-списка я вытащу все ссылки.</li>"
+        "<li>Перешлёшь уже добавленный чат ещё раз — обновлю название, описание и картинку.</li>"
         "<li>Или /import, затем вставь текст или пришли .txt со ссылками.</li>"
-        "<li><code>/import Крипта</code> — сразу в нужную категорию.</li>"
         "<li><code>/avatars</code> — подтянуть аватарки чатам, у которых их нет.</li><li>Сделай бота админом канала-источника и пропиши его в SOURCE_CHANNELS — новые посты будут импортироваться сами.</li></ol></details>"
         "<details><summary>Команды</summary><ul>"
         "<li><code>/del 15</code> или <code>/del @username</code> — удалить</li>"
-        "<li><code>/addcat 🍔 Еда</code> — новая категория</li>"
-        "<li><code>/delcat 7</code> — удалить категорию</li></ul></details>"
+        "</ul></details>"
     )
     return body, kb([btn(f"📝 Модерация ({st['pending']})", "pend", style="primary")],
                     [btn("📥 Массовый импорт", "imp", style="success")],
                     [btn("⬅️ Меню", "home")])
 
 
-def import_report(added, dup, failed, names, category=None):
+def import_report(added, dup, failed, names):
     lst = "".join(f"<li>{esc(n)}</li>" for n in names[:25])
     more = f"<p>…и ещё {len(names) - 25}</p>" if len(names) > 25 else ""
-    cat = f"<p>Категория: <b>{esc(category)}</b></p>" if category else ""
     return (
-        "<h2>📥 Импорт завершён</h2>" + cat +
+        "<h2>📥 Импорт завершён</h2>" +
         "<table bordered compact>"
         f"<tr><td>✅ Добавлено</td><td align=\"right\"><b>{added}</b></td></tr>"
         f"<tr><td>♻️ Уже были</td><td align=\"right\">{dup}</td></tr>"

@@ -6,7 +6,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramF
 
 import db
 from config import ALLOW_CHANNELS
-from linkparser import Found
+from linkparser import Found, Post
 
 log = logging.getLogger("import")
 
@@ -15,7 +15,7 @@ async def resolve(bot: Bot, f: Found) -> dict | None:
     """Возвращает поля чата или None, если это не группа/канал."""
     if f.kind == "invite":
         # Бот не умеет «заглядывать» в приватные инвайты — берём подпись из поста
-        return {"invite": f.key, "title": f.label or "Приватный чат", "kind": "private_link"}
+        return {"invite": f.key, "title": f.label or "Чат", "kind": "private_link"}
     for _ in range(3):
         try:
             ch = await bot.get_chat("@" + f.key)
@@ -38,14 +38,40 @@ async def resolve(bot: Bot, f: Found) -> dict | None:
             "avatar_id": ch.photo.big_file_id if ch.photo else None}
 
 
-async def run_import(bot: Bot, found: list[Found], added_by: int, category_id=None,
-                     status="approved", source="import", progress=None):
+def post_fields(p: Post | None, cover_id: str | None = None) -> dict:
+    """Поля, которые берём из поста-карточки (название, описание, возраст, теги, картинка)."""
+    if not p:
+        return {"cover_id": cover_id} if cover_id else {}
+    d = {"title": p.title, "about": p.about, "age": p.age, "tags": p.tags, "cover_id": cover_id}
+    return {k: v for k, v in d.items() if v}
+
+
+async def enrich(existing: dict, extra: dict):
+    """Повторная пересылка поста дополняет уже добавленный чат (название, обложка, описание…)."""
+    upd = {}
+    for k, v in extra.items():
+        cur = existing.get(k)
+        if not cur or existing.get("kind") == "private_link" or k in ("cover_id", "age", "tags"):
+            if cur != v:
+                upd[k] = v
+    if upd:
+        await db.update_chat(existing["id"], **upd)
+    return bool(upd)
+
+
+async def run_import(bot: Bot, found: list[Found], added_by: int, status="approved", source="import",
+                     progress=None, extra: dict | None = None):
+    """extra — поля из поста (для поста об одном чате): перекрывают данные getChat у инвайтов
+    и дополняют публичные чаты. Возвращает (added, dup, failed, names)."""
+    extra = extra or {}
     added, dup, failed, names = 0, 0, 0, []
     for i, f in enumerate(found, 1):
         exists = await db.find_existing(username=f.key if f.kind == "public" else None,
                                         invite=f.key if f.kind == "invite" else None)
         if exists:
             dup += 1
+            if extra and await enrich(exists, extra):
+                names.append("♻️ обновлён: " + (extra.get("title") or exists["title"] or f.key))
         else:
             data = await resolve(bot, f)
             if not data:
@@ -53,14 +79,20 @@ async def run_import(bot: Bot, found: list[Found], added_by: int, category_id=No
             elif data.get("tg_id") and await db.find_existing(tg_id=data["tg_id"]):
                 dup += 1
             else:
-                rid = await db.add_chat(**data, category_id=category_id, status=status,
-                                        added_by=added_by, source=source)
+                if data["kind"] == "private_link":
+                    data.update(extra)
+                else:  # у публичного чата название и описание свои, из поста — то, чего нет
+                    for k, v in extra.items():
+                        if k in ("cover_id", "age", "tags") or not data.get(k):
+                            data[k] = v
+                rid = await db.add_chat(**data, status=status, added_by=added_by, source=source)
                 if rid:
                     added += 1
                     names.append(data["title"] or data.get("username") or f.key)
                 else:
                     dup += 1
-            await asyncio.sleep(0.4)  # бережём лимиты на resolveUsername
+            if f.kind == "public":
+                await asyncio.sleep(0.4)  # бережём лимиты на resolveUsername
         if progress and i % 10 == 0:
             await progress(i, len(found))
     return added, dup, failed, names

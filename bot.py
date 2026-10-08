@@ -10,15 +10,15 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (BotCommand, CallbackQuery, InlineQuery, InlineQueryResultArticle,
+from aiogram.types import (BotCommand, MenuButtonCommands, CallbackQuery, InlineQuery, InlineQueryResultArticle,
                            InputTextMessageContent, KeyboardButton, KeyboardButtonRequestChat,
                            Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
 import db
 import views
 from config import ADMINS, ALLOW_CHANNELS, BOT_TOKEN, PAGE_SIZE, SOURCE_CHANNELS, is_admin
-from importer import resolve, run_import
-from linkparser import Found, extract
+from importer import post_fields, resolve, run_import
+from linkparser import Found, Post, extract, parse_post
 from tgrich import Rich, esc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -33,12 +33,15 @@ ch_router = Router()  # посты каналов-источников
 
 class Add(StatesGroup):
     link = State()
-    category = State()
     about = State()
     photo = State()
 
 
 class Pic(StatesGroup):
+    waiting = State()
+
+
+class Ren(StatesGroup):
     waiting = State()
 
 
@@ -128,7 +131,17 @@ async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
     await db.touch_user(m.from_user.id, m.from_user.full_name)
     if command.args == "add":
         return await start_add(m.chat.id, state)
+    await clear_old_keyboard(m.chat.id)
     await rich.send(m.chat.id, *await home_view(m.from_user.id))
+
+
+async def clear_old_keyboard(chat_id: int):
+    """Убирает нижнюю клавиатуру, оставшуюся от прежней версии бота."""
+    try:
+        tmp = await bot.send_message(chat_id, "⌛", reply_markup=ReplyKeyboardRemove())
+        await tmp.delete()
+    except Exception:
+        pass
 
 
 @r.message(Command("cancel"))
@@ -158,7 +171,8 @@ async def start_add(chat_id, state: FSMContext):
                                     "либо выбери свой чат кнопкой ниже.", reply_markup=add_keyboard())
 
 
-async def process_add(m: Message, state: FSMContext, f: Found, tg_id=None):
+async def process_add(m: Message, state: FSMContext, f: Found, tg_id=None, post: Post | None = None,
+                      cover_id: str | None = None):
     existing = await db.find_existing(username=f.key if f.kind == "public" else None,
                                       invite=f.key if f.kind == "invite" else None, tg_id=tg_id)
     if existing and existing["status"] in ("draft", "rejected"):
@@ -178,12 +192,26 @@ async def process_add(m: Message, state: FSMContext, f: Found, tg_id=None):
         await m.answer("Не нашёл такой публичный чат. Проверь ссылку и пришли ещё раз (или /cancel).",
                        reply_markup=add_keyboard())
         return
+    extra = post_fields(post, cover_id)
+    if data["kind"] == "private_link":
+        data.update(extra)
+    else:
+        for k, v in extra.items():
+            if k in ("cover_id", "age", "tags") or not data.get(k):
+                data[k] = v
     cid = await db.add_chat(**data, status="draft", added_by=m.from_user.id, source="user")
     await state.update_data(chat_id=cid)
-    await state.set_state(Add.category)
-    await rich.send(m.chat.id,
-                    f"<h3>Нашёл: {esc(data['title'])}</h3><p>Выбери категорию:</p>",
-                    views.pick_category(await db.categories(), "ac"))
+    if post and post.title and (post.about or data.get("about")):
+        # прислали готовый пост-карточку — описание уже есть
+        return await (finish_add(m.from_user.id, m.chat.id, state) if cover_id or data.get("avatar_id")
+                      else ask_photo(m.chat.id, state))
+    await state.set_state(Add.about)
+    if data["kind"] == "private_link" and not (post and post.title):
+        hint = ("Это приватная ссылка, название я не вижу. Первой строкой напиши <b>название</b>, "
+                "дальше — описание (о чём чат, возраст).")
+    else:
+        hint = f"Нашёл: <b>{esc(data['title'])}</b>. Напиши описание до 300 символов: о чём чат, возраст участников."
+    await rich.send(m.chat.id, f"<h3>✍️ Описание</h3><p>{hint}</p>", views.kb([views.btn("Пропустить", "skip")]))
 
 
 @r.message(Add.link, F.chat_shared)
@@ -195,25 +223,13 @@ async def add_shared(m: Message, state: FSMContext):
                    "<code>t.me/+…</code> (Настройки чата → Пригласительные ссылки).")
 
 
-@r.message(Add.link, F.text)
+@r.message(Add.link, F.text | F.caption)
 async def add_link(m: Message, state: FSMContext):
-    found = extract(m.text, m.entities)
+    text, ents = message_text(m)
+    found = extract(text, ents)
     if not found:
         return await m.answer("Не вижу ссылку. Пример: <code>https://t.me/durov_chat</code> или <code>@durov_chat</code>")
-    await process_add(m, state, found[0])
-
-
-@r.callback_query(Add.category, F.data.startswith("ac:"))
-async def add_category(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    await db.update_chat(data["chat_id"], category_id=int(cq.data.split(":")[1]))
-    await state.set_state(Add.about)
-    ch = await db.chat(data["chat_id"])
-    hint = ("Первая строка станет названием (у приватных чатов я его не вижу), остальное — описанием."
-            if ch["kind"] == "private_link" else "До 300 символов: о чём чат, правила, язык.")
-    await show(cq, (f"<h3>✍️ Описание</h3><p>{hint}</p>",
-                    views.kb([views.btn("Пропустить", "skip")])))
-    await cq.answer()
+    await process_add(m, state, found[0], post=parse_post(text, ents), cover_id=photo_of(m))
 
 
 @r.message(Add.about, F.text)
@@ -221,11 +237,14 @@ async def add_about(m: Message, state: FSMContext):
     cid = (await state.get_data())["chat_id"]
     ch = await db.chat(cid)
     text = m.text.strip()
-    if ch["kind"] == "private_link":
+    if ch["kind"] == "private_link" and ch["title"] in ("Чат", "Приватный чат", None, ""):
         title, _, rest = text.partition("\n")
-        await db.update_chat(cid, title=title[:80], about=rest.strip()[:300] or None)
+        await db.update_chat(cid, title=title.strip()[:80], about=rest.strip()[:300] or None)
     else:
         await db.update_chat(cid, about=text[:300])
+    p = parse_post(text + "\n" + (views.link(ch) or ""))
+    if p and p.age:
+        await db.update_chat(cid, age=p.age)
     await ask_photo(m.chat.id, state)
 
 
@@ -238,13 +257,15 @@ async def add_skip(cq: CallbackQuery, state: FSMContext):
 async def ask_photo(chat_id, state: FSMContext):
     await state.set_state(Add.photo)
     ch = await db.chat((await state.get_data())["chat_id"])
+    if ch.get("cover_id"):
+        return await finish_add(ch["added_by"], chat_id, state)
     if ch.get("avatar_id"):
         body = ("<h3>🖼 Обложка</h3><figure><img src=\"" + views.photo_ref(ch) + "\"/>"
                 "<figcaption>Сейчас — аватарка чата</figcaption></figure>"
                 "<p>Пришли своё фото (баннер, скриншот), если хочешь заменить.</p>")
         kb = views.kb([views.btn("✅ Оставить аватарку", "photo_keep", style="success")])
     else:
-        body = "<h3>🖼 Обложка</h3><p>У чата нет аватарки. Пришли фото — так карточка заметнее в каталоге.</p>"
+        body = "<h3>🖼 Обложка</h3><p>Пришли картинку для карточки чата — так она заметнее в каталоге.</p>"
         kb = views.kb([views.btn("Без фото", "photo_keep")])
     await rich.send(chat_id, body, kb)
 
@@ -283,6 +304,15 @@ async def pic_reset(m: Message, state: FSMContext):
     await rich.send(m.chat.id, *views.card(await db.chat(cid), admin=True))
 
 
+@r.message(Ren.waiting, F.text)
+async def ren_set(m: Message, state: FSMContext):
+    cid = (await state.get_data())["ren_chat"]
+    await state.clear()
+    await db.update_chat(cid, title=m.text.strip()[:80])
+    ch = await db.chat(cid)
+    await rich.send(m.chat.id, *views.card(ch, admin=True, moderation=ch["status"] == "pending"))
+
+
 async def finish_add(uid, chat_id, state: FSMContext):
     cid = (await state.get_data())["chat_id"]
     await state.clear()
@@ -303,71 +333,100 @@ async def finish_add(uid, chat_id, state: FSMContext):
 
 
 # ============================ импорт (админ) ============================
-async def start_import(chat_id, admin_id, found, category=None, source="import"):
+async def start_import(chat_id, admin_id, found, source="import", extra=None):
     msg = await rich.send(chat_id, f"<p>⏳ Нашёл ссылок: <b>{len(found)}</b>. Проверяю…</p>")
     mid = msg["message_id"]
 
     async def progress(i, n):
         await rich.edit(chat_id, mid, f"<p>⏳ Проверено {i} из {n}…</p>")
 
-    added, dup, failed, names = await run_import(bot, found, admin_id,
-                                                 category_id=category["id"] if category else None,
-                                                 source=source, progress=progress)
-    await rich.edit(chat_id, mid, views.import_report(added, dup, failed, names, category and category["name"]),
-                    views.kb([views.btn("📚 Каталог", "cats"), views.btn("🛡 Админка", "adm")]))
+    added, dup, failed, names = await run_import(bot, found, admin_id, source=source,
+                                                 progress=progress, extra=extra)
+    await rich.edit(chat_id, mid, views.import_report(added, dup, failed, names),
+                    views.kb([views.btn("💬 Все чаты", "all:0"), views.btn("🛡 Админка", "adm")]))
+
+
+async def import_single(chat_id, admin_id, post: Post, cover_id, source):
+    """Пост про один чат -> сразу карточка в каталоге (или обновление уже добавленной)."""
+    added, dup, failed, names = await run_import(bot, [post.link], admin_id, source=source,
+                                                 extra=post_fields(post, cover_id))
+    f = post.link
+    ch = await db.find_existing(username=f.key if f.kind == "public" else None,
+                                invite=f.key if f.kind == "invite" else None)
+    if not ch:
+        return await rich.send(chat_id, "<p>⚠️ Чат по ссылке не нашёлся (или это не группа).</p>")
+    head = "✅ Добавлено" if added else ("♻️ Обновлено" if names else "Уже в каталоге")
+    await rich.send(chat_id, f"<p><b>{head}</b></p>")
+    await rich.send(chat_id, *views.card(await db.chat(ch["id"]), admin=True))
 
 
 def message_text(m: Message):
     return (m.text or m.caption or ""), (m.entities or m.caption_entities or [])
 
 
+def photo_of(m: Message):
+    return m.photo[-1].file_id if m.photo else None
+
+
+async def import_message(m: Message, admin_id: int, source: str):
+    """Общая логика для пересылки/режима импорта: один чат — карточка, много — пакетный импорт."""
+    text, ents = message_text(m)
+    if m.document and (m.document.file_name or "").lower().endswith((".txt", ".csv")):
+        buf = await bot.download(m.document)
+        text, ents = buf.read().decode("utf-8", "ignore"), []
+    post = parse_post(text, ents)
+    if post:
+        return asyncio.create_task(import_single(m.chat.id, admin_id, post, photo_of(m), source))
+    found = extract(text, ents)
+    if not found:
+        return await m.answer("Ссылок на чаты не нашёл 🤷")
+    asyncio.create_task(start_import(m.chat.id, admin_id, found, source=source))
+
+
 @r.message(Command("import"))
 async def cmd_import(m: Message, state: FSMContext, command: CommandObject):
     if not is_admin(m.from_user.id):
         return
-    cat = await db.category_by_name(command.args.strip()) if command.args else None
-    if command.args and not cat:
-        return await m.answer("Нет такой категории. Создай: <code>/addcat 🍔 Еда</code>")
     await state.set_state(Imp.waiting)
-    await state.update_data(cat_id=cat["id"] if cat else None)
     await rich.send(m.chat.id, "<h3>📥 Режим импорта</h3>"
-                               f"<p>Категория: <b>{esc(cat['name']) if cat else 'без категории'}</b></p>"
                                "<ul><li>Пересылай посты из каналов-подборок</li><li>Вставляй текст со ссылками</li>"
                                "<li>Или пришли .txt-файл</li></ul><footer>Выход — /cancel</footer>")
 
 
 @r.message(Imp.waiting, lambda m: not (m.text or "").startswith("/"))
 async def import_any(m: Message, state: FSMContext):
-    text, ents = message_text(m)
-    if m.document and (m.document.file_name or "").lower().endswith((".txt", ".csv")):
-        buf = await bot.download(m.document)
-        text, ents = buf.read().decode("utf-8", "ignore"), []
-    found = extract(text, ents)
-    if not found:
-        return await m.answer("Ссылок на чаты не нашёл 🤷")
-    cid = (await state.get_data()).get("cat_id")
-    cat = await db.category(cid) if cid else None
-    asyncio.create_task(start_import(m.chat.id, m.from_user.id, found, cat))
+    await import_message(m, m.from_user.id, "import")
 
 
 @r.message(F.forward_origin, F.from_user.id.in_(ADMINS))
 async def admin_forward(m: Message):
-    """Админ просто пересылает посты — бот сам импортирует все ссылки."""
-    found = extract(*message_text(m))
-    if found:
-        asyncio.create_task(start_import(m.chat.id, m.from_user.id, found, source="forward"))
-    else:
-        await m.answer("В пересланном посте ссылок на чаты нет.")
+    """Админ просто пересылает посты — бот сам разбирает карточку чата или список ссылок."""
+    await import_message(m, m.from_user.id, "forward")
+
+
+@r.message(F.forward_origin)
+async def user_forward(m: Message, state: FSMContext):
+    """Обычный пользователь переслал пост с чатом — оформляем как заявку."""
+    text, ents = message_text(m)
+    found = extract(text, ents)
+    if not found:
+        return await m.answer("В пересланном посте ссылок на чаты нет.")
+    await drop_draft(state)
+    await state.set_state(Add.link)
+    await process_add(m, state, found[0], post=parse_post(text, ents), cover_id=photo_of(m))
 
 
 @ch_router.channel_post()
 async def source_channel_post(m: Message):
     if not m.chat.username or m.chat.username.lower() not in SOURCE_CHANNELS:
         return
-    found = extract(*message_text(m))
+    text, ents = message_text(m)
+    post = parse_post(text, ents)
+    found = [post.link] if post else extract(text, ents)
     if not found:
         return
-    added, dup, failed, names = await run_import(bot, found, 0, source=f"@{m.chat.username}")
+    added, dup, failed, names = await run_import(bot, found, 0, source=f"@{m.chat.username}",
+                                                 extra=post_fields(post, photo_of(m)) if post else None)
     if added:
         for a in ADMINS:
             await rich.send(a, views.import_report(added, dup, failed, names) +
@@ -413,24 +472,6 @@ async def cmd_avatars(m: Message):
     await msg.edit_text(f"🖼 Готово: аватарки нашлись у {got} из {len(rows)}.")
 
 
-@r.message(Command("addcat"))
-async def cmd_addcat(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id) or not command.args:
-        return
-    emoji, _, name = command.args.strip().partition(" ")
-    if not name:
-        emoji, name = "📁", emoji
-    await db.add_category(emoji, name.strip())
-    await m.answer(f"Категория {esc(emoji)} {esc(name)} добавлена.")
-
-
-@r.message(Command("delcat"))
-async def cmd_delcat(m: Message, command: CommandObject):
-    if is_admin(m.from_user.id) and command.args and command.args.strip().isdigit():
-        await db.del_category(int(command.args))
-        await m.answer("Категория удалена, её чаты остались без категории.")
-
-
 # ============================ поиск / ссылки в свободном тексте ============================
 async def do_search(m: Message, state: FSMContext, query: str):
     await state.set_state(None)
@@ -444,12 +485,17 @@ async def search_state(m: Message, state: FSMContext):
     await do_search(m, state, m.text.strip()[:64])
 
 
-@r.message(F.text & ~F.text.startswith("/"))
+@r.message((F.text & ~F.text.startswith("/")) | (F.photo & F.caption))
 async def free_text(m: Message, state: FSMContext):
-    found = extract(m.text, m.entities)
-    if found:  # прислали ссылку — сразу предлагаем добавить
+    text, ents = message_text(m)
+    found = extract(text, ents)
+    if found:  # прислали ссылку или пост — сразу предлагаем добавить
+        if is_admin(m.from_user.id) and m.photo:
+            return await import_message(m, m.from_user.id, "admin")
         await state.set_state(Add.link)
-        return await process_add(m, state, found[0])
+        return await process_add(m, state, found[0], post=parse_post(text, ents), cover_id=photo_of(m))
+    if not m.text:
+        return
     await do_search(m, state, m.text.strip()[:64])
 
 
@@ -467,26 +513,19 @@ async def cb_home(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-@r.callback_query(F.data == "cats")
-async def cb_cats(cq: CallbackQuery):
-    await show(cq, views.categories(await db.categories()))
-    await cq.answer()
-
-
-@r.callback_query(F.data.startswith("cat:"))
-async def cb_cat(cq: CallbackQuery):
-    _, cid, page = cq.data.split(":")
-    cat = await db.category(int(cid))
-    rows, total = await db.list_chats(int(cid), offset=int(page) * PAGE_SIZE, limit=PAGE_SIZE)
-    await show(cq, views.chat_table(f"{cat['emoji']} {cat['name']}", rows, total, int(page), PAGE_SIZE, f"cat:{cid}"))
+@r.callback_query(F.data.startswith("all:"))
+async def cb_all(cq: CallbackQuery):
+    page = int(cq.data.split(":")[1])
+    rows, total = await db.list_chats(offset=page * PAGE_SIZE, limit=PAGE_SIZE)
+    await show(cq, views.chat_table("💬 Все чаты · новые сверху", rows, total, page, PAGE_SIZE, "all"))
     await cq.answer()
 
 
 @r.callback_query(F.data.startswith("top:"))
 async def cb_top(cq: CallbackQuery):
     page = int(cq.data.split(":")[1])
-    rows, total = await db.list_chats(None, offset=page * PAGE_SIZE, limit=PAGE_SIZE)
-    await show(cq, views.chat_table("🔥 Топ по участникам", rows, total, page, PAGE_SIZE, "top", back="home"))
+    rows, total = await db.list_chats(offset=page * PAGE_SIZE, limit=PAGE_SIZE, order="members DESC, id DESC")
+    await show(cq, views.chat_table("🔥 Топ по участникам", rows, total, page, PAGE_SIZE, "top"))
     await cq.answer()
 
 
@@ -523,7 +562,7 @@ async def cb_search(cq: CallbackQuery, state: FSMContext):
 
 # ---------- админские callbacks ----------
 async def next_pending(cq: CallbackQuery, prefix: str = ""):
-    rows, total = await db.list_chats(None, status="pending", limit=1, order="id ASC")
+    rows, total = await db.list_chats(status="pending", limit=1, order="id ASC")
     if not rows:
         return await show(cq, (prefix + "<p>🎉 Очередь модерации пуста.</p>",
                                views.kb([views.btn("🛡 Админка", "adm")])))
@@ -531,7 +570,7 @@ async def next_pending(cq: CallbackQuery, prefix: str = ""):
     await show(cq, (prefix + f"<p>📝 В очереди: {total}</p>" + body, kb))
 
 
-@r.callback_query(F.data.in_({"adm", "pend", "imp"}) | F.data.regexp(r"^(mod|del|delok|setcat|sc|pic):"))
+@r.callback_query(F.data.in_({"adm", "pend", "imp"}) | F.data.regexp(r"^(mod|del|delok|ren|pic):"))
 async def cb_admin(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
         return await cq.answer("Только для админов", show_alert=True)
@@ -542,9 +581,7 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         await next_pending(cq)
     elif d == "imp":
         await state.set_state(Imp.waiting)
-        await state.update_data(cat_id=None)
-        await cq.message.answer("📥 Режим импорта: пересылай посты, вставляй текст или пришли .txt. "
-                                "Для категории: <code>/import Название</code>. Выход — /cancel")
+        await cq.message.answer("📥 Режим импорта: пересылай посты, вставляй текст или пришли .txt. Выход — /cancel")
     elif d.startswith("mod:"):
         _, action, cid = d.split(":")
         ch = await db.chat(int(cid))
@@ -567,7 +604,7 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         if ch:
             await db.delete_chat(ch["id"])
         await show(cq, (f"<p>🗑 Удалено: {esc(ch['title'] if ch else '')}</p>",
-                        views.kb([views.btn("📚 Каталог", "cats")])))
+                        views.kb([views.btn("💬 Все чаты", "all:0")])))
     elif d.startswith("del:"):
         cid = d.split(":")[1]
         await rich.edit(cq.message.chat.id, cq.message.message_id, "<h3>Удалить чат из каталога?</h3>",
@@ -577,15 +614,10 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         await state.set_state(Pic.waiting)
         await state.update_data(pic_chat=int(d.split(":")[1]))
         await cq.message.answer("🖼 Пришли новое фото для карточки. Отправь «-», чтобы вернуть аватарку чата.")
-    elif d.startswith("setcat:"):
-        cid = d.split(":")[1]
-        await rich.edit(cq.message.chat.id, cq.message.message_id, "<h3>🏷 Новая категория</h3>",
-                        views.pick_category(await db.categories(), f"sc:{cid}"))
-    elif d.startswith("sc:"):
-        _, cid, cat = d.split(":")
-        await db.update_chat(int(cid), category_id=int(cat))
-        ch = await db.chat(int(cid))
-        await show(cq, views.card(ch, admin=True, moderation=ch["status"] == "pending"))
+    elif d.startswith("ren:"):
+        await state.set_state(Ren.waiting)
+        await state.update_data(ren_chat=int(d.split(":")[1]))
+        await cq.message.answer("✏️ Пришли новое название чата.")
     await cq.answer()
 
 
@@ -593,7 +625,7 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
 @dp.inline_query()
 async def inline(iq: InlineQuery):
     q = iq.query.strip()
-    rows = (await db.search(q, 0, 20))[0] if q else (await db.list_chats(None, limit=20))[0]
+    rows = (await db.search(q, 0, 20))[0] if q else (await db.list_chats(limit=20))[0]
     results = []
     for ch in rows:
         url = views.link(ch)
@@ -617,6 +649,9 @@ async def main():
         BotCommand(command="help", description="Как пользоваться"),
         BotCommand(command="cancel", description="Отменить действие"),
     ])
+    # сброс того, что осталось от прежнего бота: кнопка меню Mini App, старые апдейты/вебхук
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    await bot.delete_webhook(drop_pending_updates=True)
     logging.info("Bot started. Admins: %s", ADMINS)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 

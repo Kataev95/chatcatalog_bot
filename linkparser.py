@@ -73,3 +73,66 @@ def extract(text: str | None, entities=None) -> list[Found]:
         for m in AT_RE.finditer(line):
             put(_norm(m.group(1)), _line_label(line, m.group(0)))
     return list(out.values())
+
+
+# ---------------- пост-карточка одного чата ----------------
+# Формат каналов-подборок:
+#   💬 Амазония
+#   https://t.me/+eBD7utzeApBjY2Yy
+#
+#   Чат для общения.
+#
+#   👥 Возраст пользователей: 18+
+#
+#   #Общение
+AGE_RE = re.compile(r"возраст[^:\n]*[:\-–—]\s*([0-9]{1,2}\s*\+|[0-9]{1,2}\s*[-–—]\s*[0-9]{1,2}|без ограничений|любой)", re.I)
+TAG_RE = re.compile(r"#([\w\d_]+)")
+LEAD_JUNK = re.compile(r"^[\W_]+", re.U)  # эмодзи/значки в начале строки
+
+
+@dataclass
+class Post:
+    link: Found
+    title: str = ""
+    about: str = ""
+    age: str = ""
+    tags: str = ""
+
+
+def _clean_title(line: str) -> str:
+    t = LINK_RE.sub(" ", line)
+    t = LEAD_JUNK.sub("", t.strip())
+    return re.sub(r"\s+", " ", t).strip(" \t-—–:|•·*_~`\"'«»")[:80]
+
+
+def parse_post(text: str | None, entities=None) -> Post | None:
+    """Если пост описывает ровно один чат — достаёт название, описание, возраст и теги."""
+    found = extract(text, entities)
+    if len(found) != 1:
+        return None
+    f = found[0]
+    text = text or ""
+    lines = [l.strip() for l in text.splitlines()]
+    title, about, age = "", [], ""
+    tags = " ".join(dict.fromkeys("#" + t for t in TAG_RE.findall(text)))
+    for line in lines:
+        if not line:
+            continue
+        m = AGE_RE.search(line)
+        if m:
+            age = re.sub(r"\s+", "", m.group(1)) if m.group(1)[0].isdigit() else m.group(1)
+            continue
+        bare = LINK_RE.sub("", line)
+        bare = AT_RE.sub("", bare).strip(STRIP)
+        if not bare:  # строка — только ссылка
+            continue
+        if TAG_RE.sub("", bare).strip(STRIP + " ,") == "":  # строка — только хэштеги
+            continue
+        if not title:
+            title = _clean_title(line)
+            if title:
+                continue
+        about.append(line)
+    if f.label and not title:
+        title = _clean_title(f.label)
+    return Post(f, title=title, about="\n".join(about)[:400], age=age, tags=tags)
