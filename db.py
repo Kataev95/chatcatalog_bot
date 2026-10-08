@@ -74,6 +74,10 @@ async def chat(cid):
     return await one("SELECT * FROM chats WHERE id=?", cid)
 
 
+async def random_chat():
+    return await one("SELECT * FROM chats WHERE status='approved' ORDER BY RANDOM() LIMIT 1")
+
+
 async def delete_chat(cid):
     await run("DELETE FROM chats WHERE id=?", cid)
 
