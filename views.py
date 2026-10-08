@@ -1,4 +1,5 @@
 """Вёрстка: rich-HTML сообщения и инлайн-клавиатуры с цветными кнопками (style)."""
+import time
 from tgrich import esc
 
 KIND = {"group": "💬 Чат", "supergroup": "💬 Чат", "channel": "📢 Канал", "private_link": "💬 Чат"}
@@ -20,6 +21,24 @@ def link(ch) -> str:
 def photo_ref(ch) -> str:
     """Ссылка на фото чата для rich-сообщения; сам файл подставит tgrich через resolver."""
     return f"tg://photo?id=chat{ch['id']}" if (ch.get("cover_id") or ch.get("photo_id") or ch.get("avatar_id")) else ""
+
+
+def pinned(ch) -> bool:
+    return int(ch.get("pinned_until") or 0) > time.time()
+
+
+def rating(ch) -> str:
+    s = int(ch.get("likes") or 0) - int(ch.get("dislikes") or 0)
+    return f"{s:+d}" if s else "0"
+
+
+def days_word(n):
+    n = int(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} дня"
+    return f"{n} дней"
 
 
 def btn(text, data=None, url=None, style=None, copy=None):
@@ -65,16 +84,16 @@ def chat_table(title, rows, total, page, page_size, nav_prefix, back="home"):
         return body, kb([btn("➕ Добавить", "add", style="success")], [btn("⬅️ Назад", back)])
     trs = "".join(
         f"<tr><td align=\"right\">{page * page_size + i + 1}</td>"
-        f"<td><a href=\"{esc(link(r))}\">{esc(r['title'] or r['username'])}</a></td>"
+        f"<td>{'📌 ' if pinned(r) else ''}<a href=\"{esc(link(r))}\">{esc(r['title'] or r['username'])}</a></td>"
         f"<td align=\"center\">{esc(r.get('age') or '—')}</td>"
-        f"<td align=\"right\">{num(r['members']) if r['members'] else '—'}</td></tr>"
+        f"<td align=\"right\">{rating(r)}</td></tr>"
         for i, r in enumerate(rows)
     )
     refs = [photo_ref(r) for r in rows[:6] if photo_ref(r)]
     collage = ("<tg-collage>" + "".join(f"<img src=\"{x}\"/>" for x in refs) + "</tg-collage>") if len(refs) >= 2 else ""
     body = (
         f"<h2>{esc(title)}</h2>{collage}"
-        f"<table striped compact><tr><th>#</th><th>Чат</th><th>Возраст</th><th>👥</th></tr>{trs}</table>"
+        f"<table striped compact><tr><th>#</th><th>Чат</th><th>Возраст</th><th>👍</th></tr>{trs}</table>"
         f"<footer>Страница {page + 1} из {pages} · всего {total}. Нажми номер, чтобы открыть карточку.</footer>"
     )
     nums = [btn(str(page * page_size + i + 1), f"card:{r['id']}") for i, r in enumerate(rows)]
@@ -88,13 +107,15 @@ def chat_table(title, rows, total, page, page_size, nav_prefix, back="home"):
     return body, kb(*num_rows, nav, [btn("⬅️ Назад", back)])
 
 
-def card(ch, admin=False, moderation=False, random=False):
+def card(ch, admin=False, moderation=False, random=False, my_vote=0):
     url = link(ch)
     meta = [KIND.get(ch.get("kind"), "💬 Чат")]
     if ch.get("members"):
         meta.append(f"👥 {num(ch['members'])}")
     if ch.get("age"):
         meta.append(f"🔞 {esc(ch['age'])}")
+    if pinned(ch):
+        meta.append("📌 В топе")
     about = f"<blockquote expandable>{esc(ch['about'])}</blockquote>" if ch.get("about") else ""
     tags = f"<p>{esc(ch['tags'])}</p>" if ch.get("tags") else ""
     handle = f"<p><b>@{esc(ch['username'])}</b></p>" if ch.get("username") else ""
@@ -113,7 +134,12 @@ def card(ch, admin=False, moderation=False, random=False):
         return body, kb([btn("✅ Одобрить", f"mod:ok:{ch['id']}", style="success"),
                          btn("❌ Отклонить", f"mod:no:{ch['id']}", style="danger")],
                         [btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}")])
-    rows = [[btn("↗️ Поделиться", copy=url)]]
+    likes, dislikes = int(ch.get("likes") or 0), int(ch.get("dislikes") or 0)
+    rows = [
+        [btn(f"👍 {likes}", f"vote:1:{ch['id']}", style="success" if my_vote == 1 else None),
+         btn(f"👎 {dislikes}", f"vote:-1:{ch['id']}", style="danger" if my_vote == -1 else None)],
+        [btn("↗️ Поделиться", copy=url), btn("🚀 Поднять в топ", f"pinm:{ch['id']}")],
+    ] if ch.get("status") == "approved" else [[btn("↗️ Поделиться", copy=url)]]
     if random:
         rows.append([btn("🎲 Ещё случайный", "rnd", style="primary")])
     if admin:
@@ -140,6 +166,7 @@ def admin_panel(st):
         "</ul></details>"
     )
     return body, kb([btn(f"📝 Модерация ({st['pending']})", "pend", style="primary")],
+                    [btn("📊 Статистика", "stats")],
                     [btn("📥 Массовый импорт", "imp", style="success")],
                     [btn("⬅️ Меню", "home")])
 
@@ -155,3 +182,43 @@ def import_report(added, dup, failed, names):
         f"<tr><td>⚠️ Не найдено / не чат</td><td align=\"right\">{failed}</td></tr></table>"
         + (f"<details><summary>Что добавлено</summary><ul>{lst}</ul>{more}</details>" if names else "")
     )
+
+
+# ---------------- закрепление за звёзды ----------------
+def pin_menu(ch, plans):
+    now = "<p>📌 Сейчас чат уже в топе — новое закрепление продлит срок.</p>" if pinned(ch) else ""
+    body = (
+        f"<h2>🚀 Поднять «{esc(ch['title'] or 'чат')}» в топ</h2>"
+        "<p>Чат закрепится первым в «Все чаты» и «Топ» с отметкой 📌. Оплата — Telegram Stars ⭐.</p>"
+        f"{now}"
+    )
+    rows = [[btn(f"📌 {days_word(d)} — {s} ⭐", f"pinb:{ch['id']}:{d}", style="primary")] for d, s in plans]
+    rows.append([btn("⬅️ Назад", f"card:{ch['id']}")])
+    return body, kb(*rows)
+
+
+# ---------------- статистика ----------------
+def stats_view(s):
+    def lst(items, fmt):
+        return "<ol>" + "".join(f"<li>{fmt(x)}</li>" for x in items) + "</ol>" if items else "<p>—</p>"
+
+    pays = lst(s["last_pay"], lambda p: (f"#{p['id']} · {p['stars']} ⭐ · {days_word(p['days'])} · "
+                                         f"{esc(p['title'] or 'удалён')}{' · возврат' if p['refunded'] else ''}"))
+    body = (
+        "<h2>📊 Статистика</h2>"
+        "<table bordered compact><tr><th></th><th>24 ч</th><th>7 дней</th><th>Всего</th></tr>"
+        f"<tr><td>Новые пользователи</td><td align=\"center\">{s['new1']}</td><td align=\"center\">{s['new7']}</td>"
+        f"<td align=\"center\">{s['users']}</td></tr>"
+        f"<tr><td>Активные</td><td align=\"center\">{s['active1']}</td><td align=\"center\">{s['active7']}</td><td align=\"center\">—</td></tr>"
+        f"<tr><td>Открытия карточек</td><td align=\"center\">{s['views1']}</td><td align=\"center\">{s['views7']}</td>"
+        f"<td align=\"center\">{s['views_all']}</td></tr></table>"
+        f"<p>💬 Чатов: <b>{s['approved']}</b> · 📝 на модерации: {s['pending']} · 📌 в топе: {s['pinned']}</p>"
+        f"<p>👍 {s['likes']} · 👎 {s['dislikes']} · ⭐ заработано: <b>{s['stars']}</b> (за 7 дней {s['stars7']})</p>"
+        "<details><summary>🔥 Самые просматриваемые за 7 дней</summary>"
+        + lst(s["top_views"], lambda x: f"{esc(x['title'] or '—')} — {x['n']}") + "</details>"
+        "<details><summary>❤️ Лучший рейтинг</summary>"
+        + lst(s["top_likes"], lambda x: f"{esc(x['title'] or '—')} — 👍 {x['likes']} · 👎 {x['dislikes']}") + "</details>"
+        "<details><summary>⭐ Последние оплаты</summary>" + pays +
+        "<p>Возврат звёзд: <code>/refund номер</code></p></details>"
+    )
+    return body, kb([btn("🔄 Обновить", "stats")], [btn("🛡 Админка", "adm")])
