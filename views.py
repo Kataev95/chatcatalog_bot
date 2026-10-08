@@ -44,14 +44,12 @@ def home(st, admin=False):
     body = (
         "<h1>🗂 Каталог чатов</h1>"
         "<p>Находи живые сообщества по интересам и добавляй свои — бесплатно.</p>"
-        "<table bordered compact>"
-        "<tr><th>Чатов</th><th>Охват</th><th>Пользователей</th></tr>"
-        f"<tr><td align=\"center\">{st['approved']}</td><td align=\"center\">{num(st['reach'])}</td>"
-        f"<td align=\"center\">{num(st['users'])}</td></tr></table>"
+        f"<p>💬 В каталоге <b>{st['approved']}</b> чатов</p>"
         "<footer>Ищи прямо отсюда: просто напиши слово, например «крипта».</footer>"
     )
     rows = [
-        [btn("💬 Все чаты", "all:0", style="primary"), btn("🔥 Топ", "top:0")],
+        [btn("💬 Все чаты", "all:0", style="primary"), btn("🔥 Топ", "top:0"),
+         btn("🎲 Рандом", "rnd")],
         [btn("➕ Добавить свой чат", "add", style="success")],
         [btn("🔍 Поиск", "search")],
     ]
@@ -90,7 +88,7 @@ def chat_table(title, rows, total, page, page_size, nav_prefix, back="home"):
     return body, kb(*num_rows, nav, [btn("⬅️ Назад", back)])
 
 
-def card(ch, admin=False, moderation=False):
+def card(ch, admin=False, moderation=False, random=False):
     url = link(ch)
     meta = [KIND.get(ch.get("kind"), "💬 Чат")]
     if ch.get("members"):
@@ -116,6 +114,8 @@ def card(ch, admin=False, moderation=False):
                          btn("❌ Отклонить", f"mod:no:{ch['id']}", style="danger")],
                         [btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}")])
     rows = [[btn("↗️ Поделиться", copy=url)]]
+    if random:
+        rows.append([btn("🎲 Ещё случайный", "rnd", style="primary")])
     if admin:
         rows.append([btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}"),
                      btn("🗑 Удалить", f"del:{ch['id']}", style="danger")])
