@@ -15,6 +15,9 @@ if DATA_DIR and not os.path.isabs(DB_PATH):
     os.makedirs(DATA_DIR, exist_ok=True)
     DB_PATH = os.path.join(DATA_DIR, os.path.basename(DB_PATH))
 PAGE_SIZE = 10
+# Платное закрепление за Telegram Stars: "дней:звёзд,дней:звёзд"
+PIN_PLANS = [tuple(int(v) for v in p.split(":")) for p in
+             os.getenv("PIN_PLANS", "1:50,7:250,30:750").replace(" ", "").split(",") if ":" in p]
 
 
 def is_admin(uid: int) -> bool:
