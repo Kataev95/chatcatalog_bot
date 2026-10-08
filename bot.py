@@ -529,6 +529,15 @@ async def cb_top(cq: CallbackQuery):
     await cq.answer()
 
 
+@r.callback_query(F.data == "rnd")
+async def cb_random(cq: CallbackQuery):
+    ch = await db.random_chat()
+    if not ch:
+        return await cq.answer("В каталоге пока нет чатов", show_alert=True)
+    await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id), random=True))
+    await cq.answer("🎲")
+
+
 @r.callback_query(F.data.startswith("s:"))
 async def cb_search_page(cq: CallbackQuery, state: FSMContext):
     page = int(cq.data.split(":")[1])
