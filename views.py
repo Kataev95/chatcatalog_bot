@@ -70,6 +70,7 @@ def home(st, admin=False):
         [btn("💬 Все чаты", "all:0", style="primary"), btn("🔥 Топ", "top:0"),
          btn("🎲 Рандом", "rnd")],
         [btn("➕ Добавить свой чат", "add", style="success")],
+        [btn("🛍 Магазин услуг · Улучшения чата", "shop", style="primary")],
         [btn("🔍 Поиск", "search")],
     ]
     if admin:
@@ -166,7 +167,7 @@ def admin_panel(st):
         "</ul></details>"
     )
     return body, kb([btn(f"📝 Модерация ({st['pending']})", "pend", style="primary")],
-                    [btn("📊 Статистика", "stats")],
+                    [btn("📊 Статистика", "stats"), btn("🛍 Заказы", "orders")],
                     [btn("📥 Массовый импорт", "imp", style="success")],
                     [btn("⬅️ Меню", "home")])
 
@@ -202,8 +203,10 @@ def stats_view(s):
     def lst(items, fmt):
         return "<ol>" + "".join(f"<li>{fmt(x)}</li>" for x in items) + "</ol>" if items else "<p>—</p>"
 
-    pays = lst(s["last_pay"], lambda p: (f"#{p['id']} · {p['stars']} ⭐ · {days_word(p['days'])} · "
-                                         f"{esc(p['title'] or 'удалён')}{' · возврат' if p['refunded'] else ''}"))
+    import shop
+    pays = lst(s["last_pay"], lambda p: (f"#{p['id']} · {p['stars']} ⭐ · " + (
+        esc(shop.title(p['service'], p.get('qty') or 1)) if p.get('service') else
+        f"📌 {days_word(p['days'])} · {esc(p['title'] or 'удалён')}") + (' · возврат' if p['refunded'] else '')))
     body = (
         "<h2>📊 Статистика</h2>"
         "<table bordered compact><tr><th></th><th>24 ч</th><th>7 дней</th><th>Всего</th></tr>"
@@ -214,6 +217,7 @@ def stats_view(s):
         f"<td align=\"center\">{s['views_all']}</td></tr></table>"
         f"<p>💬 Чатов: <b>{s['approved']}</b> · 📝 на модерации: {s['pending']} · 📌 в топе: {s['pinned']}</p>"
         f"<p>👍 {s['likes']} · 👎 {s['dislikes']} · ⭐ заработано: <b>{s['stars']}</b> (за 7 дней {s['stars7']})</p>"
+        f"<p>🛍 Услуги: {s['shop_stars']} ⭐ · открытых заказов: {s['orders_open']}</p>"
         "<details><summary>🔥 Самые просматриваемые за 7 дней</summary>"
         + lst(s["top_views"], lambda x: f"{esc(x['title'] or '—')} — {x['n']}") + "</details>"
         "<details><summary>❤️ Лучший рейтинг</summary>"
@@ -222,3 +226,68 @@ def stats_view(s):
         "<p>Возврат звёзд: <code>/refund номер</code></p></details>"
     )
     return body, kb([btn("🔄 Обновить", "stats")], [btn("🛡 Админка", "adm")])
+
+
+# ---------------- магазин услуг ----------------
+def shop_menu():
+    import shop
+    trs = "".join(
+        f"<tr><td>{s['emoji']} <b>{esc(s['name'])}</b>{' 🔥' if s.get('hit') else ''}<br/>"
+        f"<i>{esc(s['short'])}</i></td>"
+        f"<td align=\"right\"><b>{s['price']} ⭐</b>{'<br/>за 1 ' + s['unit'] if s.get('unit') else ''}</td></tr>"
+        for s in shop.SERVICES.values()
+    )
+    body = (
+        "<h1>🛍 Магазин услуг</h1>"
+        "<p><b>Улучшения чата</b> — сделаем ваш чат живее, ярче и заметнее.</p>"
+        f"<table striped><tr><th>Услуга</th><th>Цена</th></tr>{trs}</table>"
+        "<footer>Оплата — Telegram Stars ⭐ прямо в боте. Нажми услугу, чтобы узнать подробности.</footer>"
+    )
+    keys = list(shop.SERVICES)
+    rows = [[btn(f"{shop.SERVICES[k]['emoji']} {shop.SERVICES[k]['name']}", f"svc:{k}",
+                 style="primary" if shop.SERVICES[k].get("hit") else None)] for k in keys]
+    rows.append([btn("🚀 Поднять свой чат в топ", "pinhelp")])
+    rows.append([btn("⬅️ Меню", "home")])
+    return body, kb(*rows)
+
+
+def service_card(key):
+    import shop
+    s = shop.SERVICES[key]
+    perks = "".join(f"<li>{esc(p)}</li>" for p in s.get("perks", []))
+    ex = s.get("examples") or []
+    ex_row = ("<tg-button-row align=\"center\">" + "".join(
+        f"<tg-button type=\"url\" url=\"{esc(u)}\">{esc(t)}</tg-button>" for t, u in ex) + "</tg-button-row>") if ex else ""
+    price = f"{s['price']} ⭐" + (f" за 1 {s['unit']}" if s.get("unit") else "")
+    body = (
+        f"<h2>{s['emoji']} {esc(s['name'])}</h2>"
+        f"<p>{esc(s['about'])}</p>"
+        + (f"<ul>{perks}</ul>" if perks else "")
+        + ex_row
+        + f"<h3>💰 Цена: {price}</h3>"
+        "<footer>После оплаты бот передаст заказ администратору, он свяжется с вами.</footer>"
+    )
+    if s.get("qty"):
+        rows = [[btn(f"🛒 {q} {s['unit']} — {s['price'] * q} ⭐", f"svcb:{key}:{q}", style="success")]
+                for q in s["qty"]]
+    else:
+        rows = [[btn(f"🛒 Купить за {s['price']} ⭐", f"svcb:{key}:1", style="success")]]
+    rows += [[btn(t, url=u) for t, u in ex]] if ex else []
+    rows.append([btn("⬅️ Все услуги", "shop")])
+    return body, kb(*rows)
+
+
+def orders_view(rows):
+    import shop
+    if not rows:
+        items = "<p>🎉 Открытых заказов нет.</p>"
+    else:
+        items = "<ol>" + "".join(
+            f"<li>#{o['id']} · {esc(shop.title(o['service'], o['qty']))} · {o['stars']} ⭐ · "
+            f"<a href=\"tg://user?id={o['user_id']}\">{esc(o.get('name') or o['user_id'])}</a>"
+            f"{' · 📝 ' + esc((o.get('brief') or '')[:80]) if o.get('brief') else ''}</li>"
+            for o in rows) + "</ol>"
+    body = ("<h2>🛍 Заказы услуг</h2>" + items +
+            "<footer>Выполнил заказ — <code>/done номер</code>, бот уведомит покупателя. "
+            "Возврат — <code>/refund номер</code>.</footer>")
+    return body, kb([btn("🔄 Обновить", "orders")], [btn("🛡 Админка", "adm")])
