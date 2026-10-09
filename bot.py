@@ -16,6 +16,7 @@ from aiogram.types import (LabeledPrice, PreCheckoutQuery, BotCommand, MenuButto
                            Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 
 import db
+import shop
 import views
 from config import ADMINS, ALLOW_CHANNELS, BOT_TOKEN, PAGE_SIZE, PIN_PLANS, SOURCE_CHANNELS, is_admin
 from importer import post_fields, resolve, run_import
@@ -66,6 +67,10 @@ class Imp(StatesGroup):
 
 class Srch(StatesGroup):
     waiting = State()
+
+
+class Order(StatesGroup):
+    brief = State()
 
 
 CANCEL = "❌ Отмена"
@@ -631,17 +636,22 @@ async def cb_pin_buy(cq: CallbackQuery):
 async def pre_checkout(pq: PreCheckoutQuery):
     ok = False
     try:
-        kind, cid, days = pq.invoice_payload.split(":")
-        ch = await db.chat(int(cid))
-        ok = kind == "pin" and ch and ch["status"] == "approved" and dict(PIN_PLANS).get(int(days)) == pq.total_amount
+        kind, a, b = pq.invoice_payload.split(":")
+        if kind == "pin":
+            ch = await db.chat(int(a))
+            ok = ch and ch["status"] == "approved" and dict(PIN_PLANS).get(int(b)) == pq.total_amount
+        elif kind == "svc":
+            ok = shop.get(a) is not None and shop.total(a, int(b)) == pq.total_amount
     except Exception:
         pass
-    await pq.answer(ok=bool(ok), error_message=None if ok else "Чат удалён или тариф изменился. Деньги не списаны.")
+    await pq.answer(ok=bool(ok), error_message=None if ok else "Услуга или тариф изменились. Звёзды не списаны.")
 
 
 @pay.message(F.successful_payment)
-async def paid(m: Message):
+async def paid(m: Message, state: FSMContext):
     sp = m.successful_payment
+    if sp.invoice_payload.startswith("svc:"):
+        return await paid_service(m, state)
     _, cid, days = sp.invoice_payload.split(":")
     until = await db.pin(int(cid), m.from_user.id, int(days), sp.total_amount, sp.telegram_payment_charge_id)
     ch = await db.chat(int(cid))
@@ -658,10 +668,45 @@ async def paid(m: Message):
             pass
 
 
+async def notify_admins(body, kb=None, copy_from: Message | None = None):
+    for a in ADMINS:
+        try:
+            await rich.send(a, body, kb)
+            if copy_from:
+                await copy_from.copy_to(a)
+        except Exception:
+            logging.exception("notify admin %s", a)
+
+
+async def paid_service(m: Message, state: FSMContext):
+    sp = m.successful_payment
+    _, key, qty = sp.invoice_payload.split(":")
+    qty = int(qty)
+    s = shop.get(key) or {}
+    oid = await db.add_order(m.from_user.id, key, qty, sp.total_amount, sp.telegram_payment_charge_id)
+    name = esc(shop.title(key, qty))
+    if s.get("brief"):
+        await state.set_state(Order.brief)
+        await state.update_data(order_id=oid)
+        await rich.send(m.chat.id, f"<h3>✅ Оплачено! Заказ #{oid}: {name}</h3>"
+                                   f"<p>Остался один шаг. {esc(s['brief'])}</p>"
+                                   "<p>👇 Напишите ответ одним сообщением, я сразу передам его администратору.</p>")
+    else:
+        await rich.send(m.chat.id, f"<h3>✅ Оплачено! Заказ #{oid}: {name}</h3>"
+                                   "<p>🍬 Ожидайте поступления ирисок. Администратор отправит их в ближайшее время.</p>",
+                        views.kb([views.btn("🛍 Магазин услуг", "shop"), views.btn("⬅️ Меню", "home")]))
+    await notify_admins(f"<p>🛍 <b>Новый заказ #{oid}</b>: {name} · {sp.total_amount} ⭐ от "
+                        f"<a href=\"tg://user?id={m.from_user.id}\">{esc(m.from_user.full_name)}</a>"
+                        f"{' (@' + esc(m.from_user.username) + ')' if m.from_user.username else ''} · ID "
+                        f"<code>{m.from_user.id}</code></p>"
+                        f"<p>{'Ждём анкету от покупателя.' if s.get('brief') else 'Отправьте ириски покупателю.'}</p>",
+                        views.kb([views.btn("✅ Выполнено", f"ordok:{oid}", style="success")]))
+
+
 @r.message(Command("paysupport"))
 async def cmd_paysupport(m: Message):
-    await m.answer("💬 Вопросы по оплате закрепления: напишите сюда, что случилось, и укажите название чата — "
-                   "администратор ответит и при необходимости вернёт звёзды.")
+    await m.answer("💬 Вопросы по оплате закрепления или услуг: напишите сюда, что случилось, и укажите номер заказа "
+                   "или название чата — администратор ответит и при необходимости вернёт звёзды.")
 
 
 @r.message(Command("refund"))
@@ -678,7 +723,98 @@ async def cmd_refund(m: Message, command: CommandObject):
     except Exception as e:
         return await m.answer(f"Не получилось: {esc(str(e))}")
     await db.mark_refunded(p["id"])
-    await m.answer(f"↩️ Возвращено {p['stars']} ⭐, закрепление снято на {views.days_word(p['days'])}.")
+    if p.get("service"):
+        await m.answer(f"↩️ Возвращено {p['stars']} ⭐ за заказ #{p['id']} ({shop.title(p['service'], p.get('qty') or 1)}).")
+    else:
+        await m.answer(f"↩️ Возвращено {p['stars']} ⭐, закрепление снято на {views.days_word(p['days'])}.")
+
+
+@r.message(Command("done"))
+async def cmd_done(m: Message, command: CommandObject):
+    if not is_admin(m.from_user.id):
+        return
+    arg = (command.args or "").strip().lstrip("#")
+    if not arg.isdigit():
+        return await m.answer("Использование: /done номер_заказа")
+    await m.answer(await finish_order(int(arg)))
+
+
+async def finish_order(oid: int) -> str:
+    p = await db.payment(oid)
+    if not p or not p.get("service"):
+        return "Заказ не найден."
+    if p["refunded"]:
+        return f"Заказ #{oid} уже возвращён."
+    if p.get("status") == "done":
+        return f"Заказ #{oid} уже отмечен выполненным."
+    await db.set_order(oid, status="done")
+    msg = "🍬 Ириски отправлены!" if p["service"] == "iriski" else "Ваш заказ готов!"
+    try:
+        await rich.send(p["user_id"], f"<h3>🎉 Заказ #{oid} выполнен</h3><p>{esc(shop.title(p['service'], p['qty'] or 1))}. "
+                                      f"{msg} Спасибо, что выбрали нас ⭐</p>",
+                        views.kb([views.btn("🛍 Магазин услуг", "shop")]))
+    except Exception:
+        return f"✅ Заказ #{oid} закрыт, но покупатель не получил уведомление (бот заблокирован?)."
+    return f"✅ Заказ #{oid} закрыт, покупатель уведомлён."
+
+
+# ---------- магазин услуг ----------
+@r.callback_query(F.data == "shop")
+async def cb_shop(cq: CallbackQuery):
+    await show(cq, views.shop_menu())
+    await cq.answer()
+
+
+@r.callback_query(F.data == "pinhelp")
+async def cb_pinhelp(cq: CallbackQuery):
+    await cq.answer("Открой карточку своего чата в «Все чаты» и нажми «🚀 Поднять в топ».", show_alert=True)
+
+
+@r.callback_query(F.data.startswith("svc:"))
+async def cb_service(cq: CallbackQuery):
+    key = cq.data.split(":")[1]
+    if not shop.get(key):
+        return await cq.answer("Услуга недоступна", show_alert=True)
+    await show(cq, views.service_card(key))
+    await cq.answer()
+
+
+@r.callback_query(F.data.startswith("svcb:"))
+async def cb_service_buy(cq: CallbackQuery):
+    _, key, qty = cq.data.split(":")
+    s, qty = shop.get(key), int(qty)
+    if not s:
+        return await cq.answer("Услуга недоступна", show_alert=True)
+    await bot.send_invoice(
+        cq.message.chat.id,
+        title=shop.title(key, qty)[:32],
+        description=s["about"][:255],
+        payload=f"svc:{key}:{qty}",
+        currency="XTR",
+        prices=[LabeledPrice(label=shop.title(key, qty)[:32], amount=shop.total(key, qty))],
+    )
+    await cq.answer()
+
+
+@r.callback_query(F.data.startswith("ordok:"))
+async def cb_order_done(cq: CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        return await cq.answer("Только для админов", show_alert=True)
+    await cq.answer(await finish_order(int(cq.data.split(":")[1])), show_alert=True)
+
+
+@pay.message(Order.brief, F.chat.type == "private", lambda m: not (m.text or "").startswith("/"))
+async def order_brief(m: Message, state: FSMContext):
+    oid = (await state.get_data()).get("order_id")
+    await state.clear()
+    text = m.text or m.caption or "(вложение)"
+    if oid:
+        await db.set_order(oid, brief=text[:1000], status="brief")
+    await m.answer("🙏 Спасибо! Передал администратору, он свяжется с вами в ближайшее время. "
+                   "Дополнения можно присылать через /paysupport.")
+    await notify_admins(f"<p>📝 <b>Анкета к заказу #{oid}</b> от "
+                        f"<a href=\"tg://user?id={m.from_user.id}\">{esc(m.from_user.full_name)}</a>:</p>",
+                        views.kb([views.btn("✅ Выполнено", f"ordok:{oid}", style="success")]), copy_from=m)
 
 
 @r.callback_query(F.data == "add")
@@ -704,7 +840,7 @@ async def next_pending(cq: CallbackQuery, prefix: str = ""):
     await show(cq, (prefix + f"<p>📝 В очереди: {total}</p>" + body, kb))
 
 
-@r.callback_query(F.data.in_({"adm", "pend", "imp", "stats"}) | F.data.regexp(r"^(mod|del|delok|ren|pic):"))
+@r.callback_query(F.data.in_({"adm", "pend", "imp", "stats", "orders"}) | F.data.regexp(r"^(mod|del|delok|ren|pic):"))
 async def cb_admin(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
         return await cq.answer("Только для админов", show_alert=True)
@@ -713,6 +849,8 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         await show(cq, views.admin_panel(await db.stats()))
     elif d == "stats":
         await show(cq, views.stats_view(await db.full_stats()))
+    elif d == "orders":
+        await show(cq, views.orders_view(await db.open_orders()))
     elif d == "pend":
         await next_pending(cq)
     elif d == "imp":
