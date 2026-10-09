@@ -40,6 +40,10 @@ async def init():
         if col not in cols:
             await _db.execute(f"ALTER TABLE chats ADD COLUMN {col} INTEGER DEFAULT 0")
     ucols = {r[1] for r in await (await _db.execute("PRAGMA table_info(users)")).fetchall()}
+    pcols = {r[1] for r in await (await _db.execute("PRAGMA table_info(payments)")).fetchall()}
+    for col, typ in (("service", "TEXT"), ("qty", "INTEGER DEFAULT 1"), ("status", "TEXT"), ("brief", "TEXT")):
+        if col not in pcols:
+            await _db.execute(f"ALTER TABLE payments ADD COLUMN {col} {typ}")
     if "last_seen" not in ucols:
         await _db.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
     await _db.commit()
@@ -143,9 +147,27 @@ async def payment(pid):
 async def mark_refunded(pid):
     p = await payment(pid)
     await run("UPDATE payments SET refunded=1 WHERE id=?", pid)
-    if p:
+    if p and not p.get("service"):
         await run("UPDATE chats SET pinned_until=MAX(0, COALESCE(pinned_until,0) - ?) WHERE id=?",
                   p["days"] * 86400, p["chat_id"])
+
+
+# ---------- магазин услуг ----------
+async def add_order(uid, service, qty, stars, charge_id):
+    pid, _ = await run("""INSERT INTO payments(user_id,chat_id,days,stars,charge_id,ts,service,qty,status)
+                          VALUES(?,NULL,0,?,?,?,?,?,'new')""", uid, stars, charge_id, int(time.time()), service, qty)
+    return pid
+
+
+async def set_order(pid, **f):
+    keys = ", ".join(f"{k}=?" for k in f)
+    await run(f"UPDATE payments SET {keys} WHERE id=?", *f.values(), pid)
+
+
+async def open_orders():
+    return await q("""SELECT p.*, u.name FROM payments p LEFT JOIN users u ON u.id=p.user_id
+                      WHERE p.service IS NOT NULL AND p.refunded=0 AND COALESCE(p.status,'new')!='done'
+                      ORDER BY p.id DESC LIMIT 30""")
 
 
 # ---------- статистика ----------
@@ -167,13 +189,16 @@ async def full_stats():
         (SELECT COUNT(*) FROM votes WHERE v=-1) dislikes,
         (SELECT COUNT(*) FROM chats WHERE {PINNED}) pinned,
         (SELECT COALESCE(SUM(stars),0) FROM payments WHERE refunded=0) stars,
-        (SELECT COALESCE(SUM(stars),0) FROM payments WHERE refunded=0 AND ts>=?) stars7""",
+        (SELECT COALESCE(SUM(stars),0) FROM payments WHERE refunded=0 AND ts>=?) stars7,
+        (SELECT COALESCE(SUM(stars),0) FROM payments WHERE refunded=0 AND service IS NOT NULL) shop_stars,
+        (SELECT COUNT(*) FROM payments WHERE refunded=0 AND service IS NOT NULL
+            AND COALESCE(status,'new')!='done') orders_open""",
         d1, d7, d1, d7, d1, d7, d7)
     s["top_views"] = await q("""SELECT c.id, c.title, COUNT(*) n FROM card_views v JOIN chats c ON c.id=v.chat_id
                                 WHERE v.ts>=? GROUP BY c.id ORDER BY n DESC LIMIT 5""", d7)
     s["top_likes"] = await q("""SELECT id, title, likes, dislikes FROM chats WHERE status='approved' AND likes>0
                                 ORDER BY (likes-dislikes) DESC, likes DESC LIMIT 5""")
-    s["last_pay"] = await q("""SELECT p.id, p.stars, p.days, p.user_id, p.refunded, c.title FROM payments p
+    s["last_pay"] = await q("""SELECT p.id, p.stars, p.days, p.user_id, p.refunded, p.service, p.qty, c.title FROM payments p
                                LEFT JOIN chats c ON c.id=p.chat_id ORDER BY p.id DESC LIMIT 5""")
     return s
 
