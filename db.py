@@ -46,6 +46,11 @@ async def init():
             await _db.execute(f"ALTER TABLE payments ADD COLUMN {col} {typ}")
     if "last_seen" not in ucols:
         await _db.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
+    for col, typ in (("username", "TEXT"), ("notify", "INTEGER DEFAULT 1"), ("blocked", "INTEGER DEFAULT 0")):
+        if col not in ucols:
+            await _db.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+    if "broadcast_at" not in cols:
+        await _db.execute("ALTER TABLE chats ADD COLUMN broadcast_at INTEGER")
     await _db.commit()
 
 
@@ -66,11 +71,38 @@ async def run(sql, *a):
 
 
 # ---------- users ----------
-async def touch_user(uid, name):
+async def touch_user(uid, name, username=None):
     now = int(time.time())
-    await run("""INSERT INTO users(id,name,joined,last_seen) VALUES(?,?,?,?)
-                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, last_seen=excluded.last_seen""",
-              uid, name, now, now)
+    await run("""INSERT INTO users(id,name,username,joined,last_seen,blocked) VALUES(?,?,?,?,?,0)
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, username=excluded.username,
+                 last_seen=excluded.last_seen, blocked=0""",
+              uid, name, username, now, now)
+
+
+async def user(uid):
+    return await one("SELECT * FROM users WHERE id=?", uid) if uid else None
+
+
+async def set_user(uid, **f):
+    sets = ",".join(f"{k}=?" for k in f)
+    await run(f"UPDATE users SET {sets} WHERE id=?", *f.values(), uid)
+
+
+async def audience(exclude=()):
+    rows = await q("SELECT id FROM users WHERE COALESCE(notify,1)=1 AND COALESCE(blocked,0)=0")
+    return [r["id"] for r in rows if r["id"] not in exclude]
+
+
+async def owners(offset=0, limit=10):
+    """Чаты, добавленные пользователями (не импорт админа), с профилем владельца."""
+    where = "c.source='user' AND c.status IN ('approved','pending')"
+    total = (await one(f"SELECT COUNT(*) n FROM chats c WHERE {where}"))["n"]
+    people = (await one(f"SELECT COUNT(DISTINCT c.added_by) n FROM chats c WHERE {where}"))["n"]
+    rows = await q(f"""SELECT c.id, c.title, c.username chat_username, c.invite, c.status, c.added_by,
+                              c.created_at, u.name, u.username, u.last_seen
+                       FROM chats c LEFT JOIN users u ON u.id=c.added_by
+                       WHERE {where} ORDER BY c.id DESC LIMIT ? OFFSET ?""", limit, offset)
+    return rows, total, people
 
 
 # ---------- chats ----------
