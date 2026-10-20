@@ -108,6 +108,17 @@ def chat_table(title, rows, total, page, page_size, nav_prefix, back="home"):
     return body, kb(*num_rows, nav, [btn("⬅️ Назад", back)])
 
 
+def profile(u, uid=None):
+    """Имя владельца + @username + ID (ссылка открывает профиль)."""
+    uid = (u or {}).get("id") or uid
+    if not uid:
+        return "—"
+    name = esc((u or {}).get("name") or "Без имени")
+    uname = (u or {}).get("username")
+    at = f" · <a href=\"https://t.me/{esc(uname)}\">@{esc(uname)}</a>" if uname else ""
+    return f"<a href=\"tg://user?id={uid}\">{name}</a>{at} · ID <code>{uid}</code>"
+
+
 def card(ch, admin=False, moderation=False, random=False, my_vote=0):
     url = link(ch)
     meta = [KIND.get(ch.get("kind"), "💬 Чат")]
@@ -131,10 +142,13 @@ def card(ch, admin=False, moderation=False, random=False, my_vote=0):
         "</tg-button-row>"
     )
     if moderation:
-        body += f"<footer>Заявка #{ch['id']} · от <a href=\"tg://user?id={ch['added_by']}\">пользователя</a></footer>"
-        return body, kb([btn("✅ Одобрить", f"mod:ok:{ch['id']}", style="success"),
+        body += f"<footer>Заявка #{ch['id']} · 👤 {profile(ch.get('owner'), ch.get('added_by'))}</footer>"
+        return body, kb([btn("✅ Одобрить + 📣 всем", f"mod:okb:{ch['id']}", style="success")],
+                        [btn("✅ Без рассылки", f"mod:ok:{ch['id']}"),
                          btn("❌ Отклонить", f"mod:no:{ch['id']}", style="danger")],
                         [btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}")])
+    if admin and ch.get("source") == "user":
+        body += f"<footer>👤 Владелец: {profile(ch.get('owner'), ch.get('added_by'))}</footer>"
     likes, dislikes = int(ch.get("likes") or 0), int(ch.get("dislikes") or 0)
     rows = [
         [btn(f"👍 {likes}", f"vote:1:{ch['id']}", style="success" if my_vote == 1 else None),
@@ -146,6 +160,9 @@ def card(ch, admin=False, moderation=False, random=False, my_vote=0):
     if admin:
         rows.append([btn("✏️ Название", f"ren:{ch['id']}"), btn("🖼 Обложка", f"pic:{ch['id']}"),
                      btn("🗑 Удалить", f"del:{ch['id']}", style="danger")])
+        if ch.get("status") == "approved":
+            rows.append([btn("📣 Разослать всем" + (" (уже было)" if ch.get("broadcast_at") else ""),
+                             f"bc:{ch['id']}")])
     rows.append([btn("⬅️ Ко всем чатам", "all:0")])
     return body, kb(*rows)
 
@@ -168,6 +185,7 @@ def admin_panel(st):
     )
     return body, kb([btn(f"📝 Модерация ({st['pending']})", "pend", style="primary")],
                     [btn("📊 Статистика", "stats"), btn("🛍 Заказы", "orders")],
+                    [btn("👤 Владельцы чатов", "own:0")],
                     [btn("📥 Массовый импорт", "imp", style="success")],
                     [btn("⬅️ Меню", "home")])
 
@@ -291,3 +309,38 @@ def orders_view(rows):
             "<footer>Выполнил заказ — <code>/done номер</code>, бот уведомит покупателя. "
             "Возврат — <code>/refund номер</code>.</footer>")
     return body, kb([btn("🔄 Обновить", "orders")], [btn("🛡 Админка", "adm")])
+
+
+# ---------------- владельцы чатов ----------------
+def owners_view(rows, total, people, page, page_size):
+    pages = max(1, (total + page_size - 1) // page_size)
+    if not rows:
+        items = "<p>Пока никто не добавлял свой чат сам. Здесь будут те, кто прислал чат через «➕ Добавить».</p>"
+    else:
+        items = "<ol start=\"" + str(page * page_size + 1) + "\">" + "".join(
+            f"<li><b>{esc(r['title'] or r['chat_username'] or 'Чат')}</b>"
+            f"{' ⏳' if r['status'] == 'pending' else ''}<br/>"
+            f"👤 {profile({'id': r['added_by'], 'name': r['name'], 'username': r['username']})}"
+            f"{'<br/>📅 ' + time.strftime('%d.%m.%Y', time.localtime(r['created_at'])) if r.get('created_at') else ''}</li>"
+            for r in rows) + "</ol>"
+    body = (f"<h2>👤 Владельцы чатов</h2><p>Чатов от пользователей: <b>{total}</b> · людей: <b>{people}</b></p>"
+            + items +
+            "<footer>Нажми имя, чтобы открыть профиль. ⏳ — ещё на модерации. "
+            "Если @username нет, пользователь его не завёл или давно не заходил в бота.</footer>")
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️", f"own:{page - 1}"))
+    nav.append(btn(f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(btn("▶️", f"own:{page + 1}"))
+    nums = [btn(str(page * page_size + i + 1), f"card:{r['id']}") for i, r in enumerate(rows)]
+    return body, kb(*[nums[i:i + 5] for i in range(0, len(nums), 5)], nav, [btn("🛡 Админка", "adm")])
+
+
+# ---------------- рассылка нового чата ----------------
+def new_chat_post(ch):
+    body, _ = card(ch)
+    body = "<h3>🆕 Новый чат в каталоге!</h3>" + body
+    return body, kb([btn("📖 Открыть карточку", f"card:{ch['id']}", style="primary"),
+                     btn("🔥 Топ чатов", "top:0")],
+                    [btn("🔕 Не присылать новые чаты", "unsub")])
