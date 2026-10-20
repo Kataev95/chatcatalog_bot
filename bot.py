@@ -41,7 +41,7 @@ async def track_activity(handler, event, data):
     chat = event.chat if isinstance(event, Message) else (event.message.chat if event.message else None)
     if u and not u.is_bot and chat and chat.type == "private":
         try:
-            await db.touch_user(u.id, u.full_name)
+            await db.touch_user(u.id, u.full_name, u.username)
         except Exception:
             logging.exception("touch_user")
     return await handler(event, data)
@@ -125,6 +125,12 @@ async def home_view(uid):
     return views.home(await db.stats(), is_admin(uid))
 
 
+async def with_owner(ch):
+    if ch and ch.get("added_by"):
+        ch["owner"] = await db.user(ch["added_by"])
+    return ch
+
+
 async def drop_draft(state: FSMContext):
     data = await state.get_data()
     if data.get("chat_id"):
@@ -148,7 +154,7 @@ def add_keyboard():
 async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
     await drop_draft(state)
     await state.clear()
-    await db.touch_user(m.from_user.id, m.from_user.full_name)
+    await db.touch_user(m.from_user.id, m.from_user.full_name, m.from_user.username)
     if command.args == "add":
         return await start_add(m.chat.id, state)
     await clear_old_keyboard(m.chat.id)
@@ -343,7 +349,7 @@ async def finish_add(uid, chat_id, state: FSMContext):
     await db.update_chat(cid, status="pending")
     await rich.send(chat_id, "<h3>⏳ Заявка отправлена</h3><p>Как только модератор её одобрит, я напишу.</p>",
                     views.kb([views.btn("⬅️ Меню", "home")]))
-    ch = await db.chat(cid)
+    ch = await with_owner(await db.chat(cid))
     for a in ADMINS:
         try:
             await rich.send(a, "<p>🆕 <b>Новая заявка</b></p>")
@@ -555,6 +561,8 @@ async def cb_random(cq: CallbackQuery):
     if not ch:
         return await cq.answer("В каталоге пока нет чатов", show_alert=True)
     await db.log_view(ch["id"], cq.from_user.id)
+    if is_admin(cq.from_user.id):
+        await with_owner(ch)
     await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id), random=True,
                                                     my_vote=await db.my_vote(cq.from_user.id, ch["id"])))
     await cq.answer("🎲")
@@ -575,6 +583,8 @@ async def cb_card(cq: CallbackQuery):
     if not ch:
         return await cq.answer("Чат удалён", show_alert=True)
     await db.log_view(ch["id"], cq.from_user.id)
+    if is_admin(cq.from_user.id):
+        await with_owner(ch)
     await rich.send(cq.message.chat.id, *views.card(ch, admin=is_admin(cq.from_user.id),
                                                     my_vote=await db.my_vote(cq.from_user.id, ch["id"])))
     await cq.answer()
@@ -836,11 +846,11 @@ async def next_pending(cq: CallbackQuery, prefix: str = ""):
     if not rows:
         return await show(cq, (prefix + "<p>🎉 Очередь модерации пуста.</p>",
                                views.kb([views.btn("🛡 Админка", "adm")])))
-    body, kb = views.card(await db.chat(rows[0]["id"]), moderation=True)
+    body, kb = views.card(await with_owner(await db.chat(rows[0]["id"])), moderation=True)
     await show(cq, (prefix + f"<p>📝 В очереди: {total}</p>" + body, kb))
 
 
-@r.callback_query(F.data.in_({"adm", "pend", "imp", "stats", "orders"}) | F.data.regexp(r"^(mod|del|delok|ren|pic):"))
+@r.callback_query(F.data.in_({"adm", "pend", "imp", "stats", "orders"}) | F.data.regexp(r"^(mod|del|delok|ren|pic|own|bc|bcok):"))
 async def cb_admin(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
         return await cq.answer("Только для админов", show_alert=True)
@@ -851,6 +861,24 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         await show(cq, views.stats_view(await db.full_stats()))
     elif d == "orders":
         await show(cq, views.orders_view(await db.open_orders()))
+    elif d.startswith("own:"):
+        page = int(d.split(":")[1])
+        rows, total, people = await db.owners(page * PAGE_SIZE, PAGE_SIZE)
+        await show(cq, views.owners_view(rows, total, people, page, PAGE_SIZE))
+    elif d.startswith("bc:"):
+        cid = d.split(":")[1]
+        n = len(await db.audience())
+        await rich.send(cq.message.chat.id, f"<h3>📣 Разослать этот чат всем?</h3><p>Получат примерно {n} "
+                                            "пользователей (кроме отписавшихся).</p>",
+                        views.kb([views.btn("📣 Да, разослать", f"bcok:{cid}", style="success"),
+                                  views.btn("Отмена", f"card:{cid}")]))
+    elif d.startswith("bcok:"):
+        ch = await db.chat(int(d.split(":")[1]))
+        if not ch or ch["status"] != "approved":
+            return await cq.answer("Чат не найден", show_alert=True)
+        start_broadcast(ch, cq.from_user.id)
+        await show(cq, ("<p>📣 Рассылка запущена. Пришлю отчёт, когда закончу.</p>",
+                        views.kb([views.btn("🛡 Админка", "adm")])))
     elif d == "pend":
         await next_pending(cq)
     elif d == "imp":
@@ -862,7 +890,7 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         if not ch or ch["status"] != "pending":
             await cq.answer("Уже обработано")
             return await next_pending(cq)
-        ok = action == "ok"
+        ok = action in ("ok", "okb")
         await db.update_chat(ch["id"], status="approved" if ok else "rejected")
         try:
             if ok:
@@ -872,7 +900,10 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
                 await rich.send(ch["added_by"], f"<p>😔 Заявка «{esc(ch['title'])}» отклонена модератором.</p>")
         except Exception:
             pass
-        await next_pending(cq, f"<p>{'✅ Одобрено' if ok else '❌ Отклонено'}: {esc(ch['title'])}</p>")
+        if action == "okb":
+            start_broadcast(await db.chat(ch["id"]), cq.from_user.id)
+        await next_pending(cq, f"<p>{'✅ Одобрено' if ok else '❌ Отклонено'}: {esc(ch['title'])}"
+                               f"{' · 📣 рассылка запущена' if action == 'okb' else ''}</p>")
     elif d.startswith("delok:"):
         ch = await db.chat(int(d.split(":")[1]))
         if ch:
@@ -893,6 +924,68 @@ async def cb_admin(cq: CallbackQuery, state: FSMContext):
         await state.update_data(ren_chat=int(d.split(":")[1]))
         await cq.message.answer("✏️ Пришли новое название чата.")
     await cq.answer()
+
+
+# ============================ рассылка нового чата ============================
+_broadcasts: set = set()
+
+
+def start_broadcast(ch, admin_id):
+    t = asyncio.create_task(broadcast_chat(ch, admin_id))
+    _broadcasts.add(t)
+    t.add_done_callback(_broadcasts.discard)
+
+
+async def broadcast_chat(ch, admin_id):
+    await db.update_chat(ch["id"], broadcast_at=int(time.time()))
+    body, kb = views.new_chat_post(ch)
+    users = await db.audience(exclude={ch.get("added_by")})
+    sent = failed = 0
+    for uid in users:
+        for attempt in range(3):
+            try:
+                await rich.send(uid, body, kb)
+                sent += 1
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if "too many requests" in err or "retry after" in err:
+                    await asyncio.sleep(5 * (attempt + 1))
+                    continue
+                failed += 1
+                if any(x in err for x in ("blocked", "deactivated", "forbidden", "chat not found", "kicked")):
+                    await db.set_user(uid, blocked=1)
+                break
+        await asyncio.sleep(0.07)  # ~14 сообщений в секунду, ниже лимита Telegram
+    try:
+        await rich.send(admin_id, f"<p>📣 Рассылка «{esc(ch['title'])}» завершена: доставлено <b>{sent}</b>, "
+                                  f"не доставлено {failed} (заблокировали бота и т.п.).</p>")
+    except Exception:
+        pass
+
+
+@r.callback_query(F.data == "unsub")
+async def cb_unsub(cq: CallbackQuery):
+    await db.set_user(cq.from_user.id, notify=0)
+    await cq.message.edit_reply_markup(reply_markup=views.kb(
+        [views.btn("🔔 Снова присылать новые чаты", "sub")]))
+    await cq.answer("Больше не буду присылать новые чаты", show_alert=True)
+
+
+@r.callback_query(F.data == "sub")
+async def cb_sub(cq: CallbackQuery):
+    await db.set_user(cq.from_user.id, notify=1)
+    await cq.message.edit_reply_markup(reply_markup=views.kb([views.btn("🔕 Не присылать новые чаты", "unsub")]))
+    await cq.answer("Готово, буду присылать новые чаты 🔔", show_alert=True)
+
+
+@r.message(Command("notify"))
+async def cmd_notify(m: Message):
+    u = await db.user(m.from_user.id)
+    on = not (u and u.get("notify") == 0)
+    await db.set_user(m.from_user.id, notify=0 if on else 1)
+    await m.answer("🔕 Уведомления о новых чатах выключены. Включить: /notify" if on
+                   else "🔔 Уведомления о новых чатах включены. Выключить: /notify")
 
 
 # ============================ inline-поиск ============================
@@ -923,6 +1016,7 @@ async def main():
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="help", description="Как пользоваться"),
         BotCommand(command="cancel", description="Отменить действие"),
+        BotCommand(command="notify", description="Вкл/выкл уведомления о новых чатах"),
         BotCommand(command="paysupport", description="Помощь с оплатой"),
     ])
     # сброс того, что осталось от прежнего бота: кнопка меню Mini App, старые апдейты/вебхук
